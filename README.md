@@ -1,1 +1,491 @@
 # Wazuh-Manager-Connectivity
+  - 2.1 Change IP agent point toward manager <!--17-->
+  - 2.2 Wazuh dashboard server is not responding to changes  <!--47-->
+  - 2.3 Check Agent Connection from Manage <!--55-->
+  - 2.4 Secure Syslog Configuration for pfSense → Wazuh Manager <!--137-->
+  - 2.5 Ensure IP is static for wazuh  <!-184-->
+  - 2.6 Set static Ip and Confirm DHCP is Off and Static IP is Set  <!--244--> 
+  - 2.7 When nmcli isn’t Available or Used <!--289--> 
+  - 2.8 Tcpdump test incoming traffic <!--350-->
+  - 2.9 pfsense push a single log on port 514 udp to wazuh manager <!--407-->
+  - 2.10 Configure alerting based on alert level to email <!--453-->
+
+
+---
+
+## 2.1 Change IP agent point toward manger
+
+Switching the agent's manager target from 192.168.0.X to 192.168.0.Y. Here's the cleanest way to do it on Ubuntu:
+
+### 1. Edit the agent config file (bash):
+
+```
+sudo nano /var/ossec/etc/ossec.conf
+
+Inside the <server> block, change:
+xml
+<address>192.168.0.X</address>
+
+to:
+xml
+<address>192.168.0.Y</address>```
+
+### 2. (Optional but recommended): If you're using agent-auth and want to ensure proper re-registration (bash):
+
+sudo /var/ossec/bin/agent-auth -m 192.168.0.Y
+
+### 3. Restart the agent (bash):
+
+sudo systemctl restart wazuh-agent
+
+Confirm the agent shows up on the manager (Y): On the manager (bash):
+
+/var/ossec/bin/agent_control -l
+
+---
+
+## 2.2 Wazuh dashboard server is not responding to changes
+Stopping all the services and restarting for refreshing wazuh-manager
+```
+sudo systemctl start wazuh-indexer ; systemctl start wazuh-manager ; systemctl start wazuh-dashboard
+```
+
+---
+
+## 2.3 Check Agent Connection from Manager
+### 1. Use the Wazuh manager to verify agent status:
+
+sudo /var/ossec/bin/manage_agents
+Press L to list agents.
+
+You’ll see each agent’s name, IP, and assigned ID.
+
+You can also add, remove, or extract keys from this interface.
+
+To check a specific agent’s status:
+
+bash
+sudo /var/ossec/bin/agent_control -i 002 | grep Status
+-i specifies the agent ID (e.g., 002).
+
+This filters the output to show only the status line.
+
+### 2. Verify Network Connection (Windows Agent)
+
+netstat -ano | findstr :1514
+
+**Example output:**
+
+TCP    192.168.0.180:63929    192.168.0.173:1514     ESTABLISHED     16500
+
+**Test connectivity to manager:**
+
+Test-NetConnection -ComputerName 192.168.0.173 -Port 1514
+
+**Expected result:**
+
+TcpTestSucceeded : True
+
+### 3. Check Agent Logs (Windows)
+
+notepad "C:\Program Files (x86)\ossec-agent\ossec.log"
+If you see these errors, the agent won’t communicate with the manager:
+
+Code
+ERROR: (4112): Invalid server address found: '0.0.0.0'
+ERROR: (1215): No client configured. Exiting.
+
+### 4. Validate Agent Configuration
+
+**Windows Agent**
+
+notepad "C:\Program Files (x86)\ossec-agent\ossec.conf"
+
+**Linux Agent**
+
+sudo nano /var/ossec/etc/ossec.conf
+
+``` xml
+<ossec_config>
+  <client>
+    <server>
+      <address>192.168.0.174</address>
+      <port>1514</port>
+      <protocol>tcp</protocol>
+    </server>
+    <crypto_method>aes</crypto_method>
+    <notify_time>10</notify_time>
+    <time-reconnect>60</time-reconnect>
+    <auto_restart>yes</auto_restart>
+  </client>
+</ossec_config>
+```
+
+### Restart the agent:
+
+**Windows:**
+
+net start wazuh
+
+**Linux:**
+
+sudo systemctl restart wazuh-agent
+
+
+---
+
+## 2.4 Secure Syslog Configuration for pfSense → Wazuh Manager
+
+### Why secure connection won’t Work for pfSense
+If your Wazuh manager is configured with:
+
+```xml
+<connection>secure</connection>
+```
+…it expects encrypted communication from Wazuh agents only. This uses the Wazuh agent protocol (TLS + authentication), and does not accept raw syslog messages. That means:
+ - pfSense logs sent via syslog will be ignored.
+ - You’ll see no alerts or log entries from pfSense.
+
+### Correct Setup for pfSense Syslog Forwarding
+To accept logs from pfSense, your Wazuh manager must be configured to receive syslog traffic, not agent traffic.
+
+Edit /var/ossec/etc/ossec.conf and ensure the <remote> block looks like this:
+
+```xml
+<remote>
+  <connection>syslog</connection>
+  <port>1514</port>
+  <protocol>udp</protocol>  <!-- Or TCP, depending on pfSense -->
+</remote>
+```
+
+### Explanation:
+ - `<connection>syslog</connection>` tells Wazuh to accept raw syslog messages.
+ - `<port>1514</port>` is the listening port (pfSense default is 514, but Wazuh often uses 1514).
+ - `<protocol>udp</protocol>` matches pfSense’s default syslog method. Use tcp only if you’ve configured pfSense to send logs via TCP.
+### Testing pfSense Log Delivery
+From pfSense, you can send a test log using nc (Netcat):
+
+`**echo "<13>Test log from pfSense to Wazuh" | nc -u -w1 192.168.0.x 1514**`
+
+ - **<13>** is the syslog priority (USER facility, NOTICE severity).
+ - **nc -u**: Sends via UDP.
+ - **-w1**: Waits 1 second before timeout.
+ - **192.168.0.x**: Replace with your Wazuh manager’s IP.
+On the Wazuh manager, confirm receipt:
+
+**sudo tcpdump -i any port 1514 -n**
+
+Look for your test message in the packet capture.
+
+
+---
+
+## 2.5 Ensure IP is static for wazuh
+
+To avoid DHCP changes and ensure consistent connectivity, configure a static IP based on your OVA’s base OS.
+
+### Identify Your Base OS
+Run either of the following to determine if your OVA is Ubuntu, CentOS, or Debian:
+
+**cat /etc/os-release**
+Or:
+
+**uname -a**
+
+### Ubuntu-Based OVA (Without Netplan)
+If netplan is not available and you're sure it's Ubuntu, the system may use systemd-networkd.
+
+### Locate the interface file:
+
+**ls /etc/systemd/network/**
+If a config file exists (e.g., eth0.network), edit it:
+
+```ini
+[Match]
+Name=eth0
+
+[Network]
+DHCP=no
+Address=192.168.1.100/24
+Gateway=192.168.1.1
+DNS=8.8.8.8
+```
+2. Reload networking:
+
+**sudo systemctl restart systemd-networkd**
+
+
+### CentOS-Based OVA
+1. Locate the interface config file:
+
+**ls /etc/sysconfig/network-scripts/ifcfg-***
+
+2. Open your interface file (e.g., ifcfg-eth0):
+
+**sudo nano /etc/sysconfig/network-scripts/ifcfg-eth0**
+3. Update the contents:
+
+```ini
+BOOTPROTO=static
+ONBOOT=yes
+IPADDR=192.168.1.100
+NETMASK=255.255.255.0
+GATEWAY=192.168.1.1
+DNS1=8.8.8.8
+```
+4. Restart networking:
+
+**sudo systemctl restart network**
+
+
+---
+
+## 2.6 Set static Ip and Confirm DHCP is Off and Static IP is Set
+
+### 1. List Network Config Files (bash)
+   
+ls /etc/systemd/network/
+Look for files like 10-eth0.network, 20-static.network, etc.
+
+### 2. Inspect the Active Config (bash)
+
+cat /etc/systemd/network/*.network
+You're looking for something like:
+
+```ini
+[Match]
+Name=eth0
+[Network]
+DHCP=no
+Address=192.168.x.x/24
+Gateway=192.168.x.x
+DNS=8.8.8.8
+```
+ - DHCP=no confirms DHCP is disabled.
+ - Address= confirms static IP is set.
+
+### 3. Check Runtime Status (bash)
+
+networkctl status eth0
+This shows whether the interface is using static or dynamic addressing.
+
+### 4. Verify IP Assignment (bash)
+
+ip a s eth0
+You should see:
+
+**inet 192.168.x.x/24 scope global eth0**
+If it says dynamic, DHCP is still active. If it says valid_lft forever, it’s static.
+
+### 5. Confirm Gateway and DNS (bash)
+
+**ip r
+cat /etc/resolv.conf**
+
+
+---
+
+## 2.7 When nmcli isn’t Available or Used
+
+ - On minimal server installations, NetworkManager (and therefore nmcli) may not be installed by default.
+ - Cloud/OVA appliances (like Wazuh OVA) often rely on lighter or more predictable methods like:
+   - netplan (Ubuntu Server)
+   - ystemd-networkd
+   - network-scripts (CentOS/older RHEL)
+   - Manual ip or ifconfig commands for custom scripts
+
+When it is option:
+
+Setting up a **static IP address** on Ubuntu ensures your system always has the same IP, which is useful for servers, remote access, and network stability. Here’s how you can do it:
+
+### **Steps to Configure a Static IP on Ubuntu**
+#### 1. **Identify Your Network Interface**  
+   Run the following command to list available interfaces (bash)
+
+   nmcli d
+   
+   or  
+
+   ip link
+
+   Find the name of the interface you want to configure (e.g., `enp0s3`).
+
+### 2. **Edit the Netplan Configuration File**  
+   Ubuntu uses **Netplan** for network configuration. Open the configuration file (bash)
+
+   sudo nano /etc/netplan/01-netcfg.yaml
+
+   If the file doesn’t exist, check `/etc/netplan/` for other `.yaml` files.
+
+### 3. **Modify the Configuration**  
+   Add or update the following lines (yaml):
+   
+   network:
+     version: 2
+     renderer: networkd
+     ethernets:
+       enp0s3:
+         dhcp4: no
+         addresses:
+           - 192.168.1.100/24
+         routes:
+           - to: default
+             via: 192.168.1.1
+         nameservers:
+           addresses: [8.8.8.8, 8.8.4.4]
+   
+   Replace `enp0s3` with your actual interface name and adjust the IP, gateway, and DNS settings.
+
+### 4. **Apply the Changes**  
+   Save the file and run (bash)
+   
+   sudo netplan apply
+
+   This will apply the new network settings.
+
+
+---
+
+## 2.8 Tcpdump test incoming traffic
+
+To capture ICMP packets from 192.168.0.254 using tcpdump, you can run:
+
+sudo tcpdump -i eth0 icmp and src host 192.168.0.254
+ - src host 192.168.0.254: Limits capture to packets originating from that IP.
+
+If you want to see both requests and replies involving that IP:
+
+sudo tcpdump -i eth0 icmp and host 192.168.0.254
+
+And for verbose output with packet details:
+
+sudo tcpdump -vv -i eth0 icmp and host 192.168.0.254
+
+
+To filter traffic by port 514 using tcpdump, you’ll want to specify the protocol and port in your capture expression. Port 514 is commonly used for syslog over UDP or TCP, depending on the setup.
+
+How to send a basic packet for test purpose
+Send TCP packet
+echo "Test message to port 514" | nc 192.168.0.x 514
+Send UDP packet 
+echo "Test message" | nc -u -q1 192.168.0.x 514
+
+### Examples for Capturing Port 514 Traffic
+
+#### 1. UDP traffic on port 514
+
+sudo tcpdump -i eth0 udp port 514
+
+#### 2. TCP traffic on port 514
+
+sudo tcpdump -i eth0 tcp port 514
+
+#### 3. All traffic involving port 514 (TCP or UDP)
+
+sudo tcpdump -i eth0 port 514
+To capture traffic from 192.168.0.x on port 514:
+
+sudo tcpdump -i eth0 src host 192.168.0.x and port 514
+Or to capture any traffic involving 192.168.0.x and port 514:
+
+sudo tcpdump -i eth0 host 192.168.0.x and port 514
+
+#### Add Verbosity or Save to File
+ - Verbose output (bash):
+	
+sudo tcpdump -vv -i eth0 port 514
+ - Show the packet contents a better option
+	sudo tcpdump -nn -A -i <interface> udp port 514
+ - Write to file for later analysis (bash):
+
+sudo tcpdump -i eth0 port 514 -w syslog_capture.pcap
+
+
+---
+
+## 2.9 pfsense push a single log on port 514 udp to wazuh manager
+
+### the pfSense shell log test log (bash):
+
+logger -n 192.168.0.x -P 514 -d "Test log from pfSense to Wazuh"
+
+### Breakdown of the Command
+
+ - logger: Built-in utility to send syslog messages.
+ - -n 192.168.0.x: Target IP address (your Wazuh server).
+ - -P 514: Destination port (default for syslog over UDP).
+ - -d: Use UDP (datagram) instead of TCP.
+ - "Test log from pfSense to Wazuh": The actual message.
+
+#### This sends a single syslog-formatted message directly to Wazuh. You can verify receipt on the Wazuh server using (bash):
+
+sudo tcpdump -i any port 514 -n
+
+Look for the incoming packet and confirm it contains your test message.
+
+#### Would you like help crafting a custom log format or automating periodic log pushes for testing Wazuh rules?
+
+logger -n 192.168.0.x -P 514 -d "Test log from pfSense to Wazuh" -n is illegal comand
+You're right, and great catch — the -n flag isn’t valid in pfSense’s version of logger. The BSD-based logger used in pfSense (FreeBSD) differs from the GNU/Linux version.
+Here’s the correct way to push a single log entry from pfSense to your Wazuh server via UDP port 514:
+
+### Use with nc (Netcat) for Direct UDP Log Transmission (bash)
+
+ - echo "<13>Test log from pfSense to Wazuh" | nc -u -w1 192.168.0.x 514
+
+### Explanation
+ - **<13>** is the syslog priority value (facility=USER, severity=NOTICE).
+ - **nc -u**: Sends via UDP
+ - **-w1**: Waits 1 second before timing out
+ - **192.168.0.x 514**: Target Wazuh IP and port
+
+This bypasses the logger utility and sends a properly formatted syslog message directly to Wazuh.
+
+### To Confirm It's Received
+
+#### On Wazuh (bash):
+
+sudo tcpdump -i any port 514 -n
+
+Look for your "Test log from pfSense to Wazuh" entry.
+
+---
+
+## 2.10 Configure alerting based on alert level to email
+
+To send email alerts to `myemail@emailprovider.com` for alerts above a certain severity level, follow these steps:
+
+### Step 1: Enable Email Notifications
+
+Edit `/var/ossec/etc/ossec.conf` and modify the `<global>` block:
+
+```xml
+<global>
+  <email_notification>yes</email_notification>
+  <smtp_server>localhost</smtp_server> <!-- Or your SMTP relay -->
+  <email_from>wazuh@yourdomain.com</email_from>
+  <email_to>myemail@emailprovider.com</email_to>
+  <email_maxperhour>100</email_maxperhour>
+</global>
+```
+Replace localhost with your SMTP server if you're not using a local relay like Postfix.
+
+email_from must match the sender address configured in your SMTP relay.
+
+Step 2: Set Alert Threshold
+Still in ossec.conf, configure the <alerts> block:
+
+```xml
+<alerts>
+  <email_alert_level>10</email_alert_level>
+</alerts>
+This means only alerts with level 10 or higher will trigger an email.
+```
+
+You can adjust the level from 1 (low) to 16 (critical), depending on your noise tolerance.
+
+### Step 3: Restart the Wazuh Manager
+Apply the changes (bash):
+
+sudo systemctl restart wazuh-manager
